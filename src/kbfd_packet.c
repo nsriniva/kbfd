@@ -20,9 +20,15 @@
  * Copyright (C) Hajime TAZAKI, 2007
  */
 
+#ifdef __KERNEL__
 #include <linux/workqueue.h>
-#include <linux/in.h>
 #include <net/sock.h>
+#include <linux/in.h>
+#include <linux/completion.h>
+#include <linux/delay.h>
+#else
+#include "proc_compat.h"
+#endif
 
 #include "kbfd_packet.h"
 #include "kbfd_session.h"
@@ -30,65 +36,165 @@
 #include "kbfd_netlink.h"
 #include "kbfd.h"
 
-extern struct bfd_master *master;
+void bfd_update_tx_sched_delay(struct bfd_session *bfd)
+{
+	int sched_delay = 0;
+	if (bfd && bfd->sec_last_sched_jiff != 0) {
+		sched_delay =
+		    jiffies_to_usecs(jiffies - bfd->sec_last_sched_jiff);
+		if (sched_delay < bfd->act_tx_intv) {
+			bfd->lateness[0]++;
+		} else if (sched_delay < (bfd->act_tx_intv * 2)) {
+			bfd->lateness[1]++;
+		} else if (sched_delay < (bfd->act_tx_intv * 3)) {
+			bfd->lateness[2]++;
+		} else {
+			bfd->lateness[3]++;
+		}
+		bfd->sec_last_sched_jiff = 0;
+	}
+}
 
 int bfd_send_ctrl_packet(struct bfd_session *bfd)
 {
-	int len, err = 0;
-	struct msghdr msg;
-	struct iovec iov;
-	mm_segment_t oldfs;
-	struct bfd_ctrl_packet pkt;
-	char buf[256];
-	struct sched_param param;
-	static int init = 0;
-
-	/* Set scheduler(FIXME) */
-	if (init == 0) {
-		param.sched_priority = MAX_RT_PRIO - 1;
-		sched_setscheduler(current, SCHED_FIFO, &param);
-		init++;
+	u_int32_t tx_intv = 0;
+	int len = -1;
+	int (*xmit) (struct bfd_session *) =
+	    bfd->proto->xmit_packet[bfd->session_type];
+	if (IS_DEBUG_CTRL_PACKET) {
+		blog_info("Called bfd_send_ctrlPacket");
 	}
 
-	memcpy(&pkt, &bfd->cpkt, sizeof(struct bfd_ctrl_packet));
+	if (!xmit)
+		goto finish;
 
-	memset(&msg, 0, sizeof(struct msghdr));
-	msg.msg_control = NULL;
-	msg.msg_controllen = 0;
-	msg.msg_iov = &iov;
-	msg.msg_iovlen = 1;
-	msg.msg_name = bfd->dst;
-	msg.msg_namelen = bfd->proto->namelen(bfd->dst);
+	bfd_update_tx_sched_delay(bfd);
+	len = xmit(bfd);
 
-	iov.iov_base = &pkt;
-	iov.iov_len = sizeof(struct bfd_ctrl_packet);
+	if (len <= 0)
+		goto finish;
 
-	oldfs = get_fs();
-	set_fs(KERNEL_DS);
-	if (IS_DEBUG_CTRL_PACKET)
-		blog_info("SEND=>: Ctrl Pkt to %s",
-			  bfd->proto->addr_print(bfd->dst, buf));
-	len = sock_sendmsg(bfd->tx_ctrl_sock, &msg, iov.iov_len);
-	if (len < 0)
-		blog_err("sock_sendmsg returned: %d", len);
-	set_fs(oldfs);
-
+	/* timestamp last ctrl pkt send time */
+	if (!bfd->cpkt.final) {
+		// Skip the statistics calculation when bfd->cpkt.final is set
+		// because this packet might not be scheduled and could skew the
+		// statistics calculation
+		if (bfd->tx_last_jiff != 0) {
+			tx_intv =
+			    jiffies_to_msecs(bfd->tx_jiff - bfd->tx_last_jiff);
+			if (tx_intv < bfd->tx_min || bfd->tx_min == 0)
+				bfd->tx_min = tx_intv;
+			if (tx_intv > bfd->tx_max)
+				bfd->tx_max = tx_intv;
+			bfd->tx_sum += tx_intv;
+			bfd->tx_n++;
+		}		/* else skip stat calculation for first packet */
+		if (IS_DEBUG_CTRL_PACKET) {
+			blog_info
+			    ("tx_jiff: %lu, tx_last_jiff: %lu, tx_intv: %u, pkt_out: %llu",
+			     bfd->tx_jiff, bfd->tx_last_jiff, tx_intv,
+			     bfd->pkt_out);
+		}
+		bfd->tx_last_jiff = bfd->tx_jiff;
+	}
 	/* Packet Count */
 	bfd->pkt_out++;
 	/* force final bit set to 0 */
 	bfd->cpkt.final = 0;
 
-	return err;
+ finish:
+	return len;
 }
 
 int
-bfd_recv_ctrl_packet(struct bfd_proto *proto, struct sockaddr *src,
+bfd_recv_echo_packet(struct bfd_proto *proto, struct sockaddr *src,
+		     struct sockaddr *dst, int ifindex, char *buffer, int len)
+{
+	struct bfd_echo_packet *epkt;
+	struct bfd_session *bfd;
+	char buf[256];
+
+	if (IS_DEBUG_CTRL_PACKET)
+		blog_info("RECV<=: Echo Pkt from %s, iif=%d",
+			  proto->addr_print(src, buf), ifindex);
+
+	epkt = (struct bfd_echo_packet *)buffer;
+
+	if ((bfd = bfd_session_lookup(proto, epkt->my_disc, 0, NULL, 0)) == NULL) {
+		if (IS_DEBUG_CTRL_PACKET) {
+			blog_info
+			    ("couldn't find session with Discriminator %d. Discarded",
+			     epkt->my_disc);
+		}
+		return -1;
+	}
+#ifdef __KERNEL__
+	if (GET_ECHO_PRIV_FIELD(bfd, echo_start))
+		bfd_reset_echo_expire_timer(bfd);
+#endif
+
+	bfd_session_release(bfd, SESSION_FIND);
+	return 0;
+}
+static inline void
+reset_rx_tx_defer(struct bfd_session *bfd)
+{
+   bfd->tx_reset_deferred = bfd->rx_reset_deferred = NULL;
+}
+
+static inline void
+check_tx_reset_defer(struct bfd_session *bfd)
+{
+#ifdef __KERNEL__
+   bfd->tx_reset_deferred = NULL;
+   if (cpu_tx_ident(bfd) && tx_work_busy(bfd)){
+      /*
+       * The tx timeout work function is ready to execute
+       * or has already started to execute but has been
+       * preempted by the real time rx thread - wait for
+       * the tx timeout function to complete.
+       */
+      bfd->tx_reset_deferred = current;
+   }
+#endif
+}
+
+static inline void
+check_packet_work_defer(struct bfd_session *bfd)
+{
+#ifdef __KERNEL__
+   bfd->rx_reset_deferred = NULL;
+   if (cpu_rx_ident(bfd) && rx_work_busy(bfd)){
+      /*
+       * The tx timeout work function is ready to execute
+       * or has already started to execute but has been
+       * preempted by the real time rx thread - wait for
+       * the tx timeout function to complete.
+       */
+      bfd->rx_reset_deferred = current;
+   }
+#endif
+}
+
+static inline void
+bfd_reset_tx_timer_defer(struct bfd_session *bfd)
+{
+        check_tx_reset_defer(bfd);
+        bfd_reset_tx_timer(bfd);
+}
+
+
+int
+bfd_recv_ctrl_packet(struct bfd_proto *proto, int vrf_fd, struct sockaddr *src,
 		     struct sockaddr *dst, int ifindex, char *buffer, int len)
 {
 	struct bfd_ctrl_packet *cpkt;
-	struct bfd_session *bfd;
+	struct bfd_session *bfd, *lag_bfd;
 	char buf[256];
 	int poll_seq_end = 0;
+	unsigned long rx_jiff;
+	u_int32_t rx_intv = 0;
+	u_int32_t old_detect_time;
 
 	if (IS_DEBUG_CTRL_PACKET)
 		blog_info("RECV<=: Ctrl Pkt from %s, iif=%d",
@@ -112,27 +218,35 @@ bfd_recv_ctrl_packet(struct bfd_proto *proto, struct sockaddr *src,
 	/* discarded. */
 	if ((!cpkt->auth && cpkt->length < BFD_CTRL_LEN) ||
 	    (cpkt->auth && cpkt->length < BFD_CTRL_AUTH_LEN)) {
-		blog_warn("length is short. Discarded");
+		if (IS_DEBUG_CTRL_PACKET) {
+			blog_warn("length is short. Discarded");
+		}
 		return -1;
 	}
 
 	/* If the Length field is greater than the payload of the */
 	/* encapsulating protocol, the packet MUST be discarded. */
 	if (cpkt->length > len) {
-		blog_warn("length is too long. Discarded. %d>%d",
-			  cpkt->length, len);
+		if (IS_DEBUG_CTRL_PACKET) {
+			blog_warn("length is too long. Discarded. %d>%d",
+				  cpkt->length, len);
+		}
 		return -1;
 	}
 
 	/* If the Detect Mult field is zero, the packet MUST be discarded. */
 	if (cpkt->detect_mult == 0) {
-		blog_warn("Detect Multi field is zero. Discarded");
+		if (IS_DEBUG_CTRL_PACKET) {
+			blog_warn("Detect Multi field is zero. Discarded");
+		}
 		return -1;
 	}
 
 	/* If the My Discriminator field is zero, the packet MUST be discarded. */
 	if (cpkt->my_disc == 0) {
-		blog_warn("My Discriminator field is zero. Discarded");
+		if (IS_DEBUG_CTRL_PACKET) {
+			blog_warn("My Discriminator field is zero. Discarded");
+		}
 		return -1;
 	}
 
@@ -141,7 +255,7 @@ bfd_recv_ctrl_packet(struct bfd_proto *proto, struct sockaddr *src,
 	/* no session is found, the packet MUST be discarded. */
 	if (cpkt->your_disc) {
 		if ((bfd =
-		     bfd_session_lookup(NULL, cpkt->your_disc, NULL,
+		     bfd_session_lookup(proto, cpkt->your_disc, 0, NULL,
 					0)) == NULL) {
 			if (IS_DEBUG_CTRL_PACKET) {
 				blog_info
@@ -153,8 +267,10 @@ bfd_recv_ctrl_packet(struct bfd_proto *proto, struct sockaddr *src,
 		/* If the Your Discriminator field is zero and the State field is not
 		   Down or AdminDown, the packet MUST be discarded. */
 		if (cpkt->state != BSM_AdminDown && cpkt->state != BSM_Down) {
-			blog_warn
-			    ("Received state is not Down or AdminDown. Discarded");
+			if (IS_DEBUG_CTRL_PACKET) {
+				blog_warn
+				    ("Received state is not Down or AdminDown. Discarded");
+			}
 			return -1;
 		}
 
@@ -167,9 +283,13 @@ bfd_recv_ctrl_packet(struct bfd_proto *proto, struct sockaddr *src,
 		   not found, a new session may be created, or the packet may be
 		   discarded.  This choice is outside the scope of this
 		   specification. */
-		if ((bfd =
-		     bfd_session_lookup(proto, cpkt->your_disc, src,
-					0)) == NULL) {
+		bfd = bfd_session_lookup(proto, 0, vrf_fd, src, 0);
+		if (bfd && bfd->session_type == BFD_LAG_SESSION) {
+			lag_bfd = bfd;
+			bfd = bfd_micro_session_lookup(lag_bfd, ifindex);
+			bfd_session_release(lag_bfd, SESSION_FIND);
+		}
+		if (!bfd) {
 			if (IS_DEBUG_CTRL_PACKET) {
 				blog_info
 				    ("couldn't find session without Discriminator field. Discarded");
@@ -179,6 +299,31 @@ bfd_recv_ctrl_packet(struct bfd_proto *proto, struct sockaddr *src,
 			return -1;
 		}
 	}
+
+	/* timestamp last ctrl pkt receive time */
+	if (!cpkt->poll) {
+		// If receiving a packet with poll bit set, skip the statistics
+		// calculation
+		rx_jiff = jiffies;
+		if (bfd->rx_last_jiff != 0) {
+			rx_intv = jiffies_to_msecs(rx_jiff - bfd->rx_last_jiff);
+			if (rx_intv < bfd->rx_min || bfd->rx_min == 0)
+				bfd->rx_min = rx_intv;
+			if (rx_intv > bfd->rx_max)
+				bfd->rx_max = rx_intv;
+			bfd->rx_sum += rx_intv;
+			bfd->rx_n++;
+		}		/* skip stat calculation for first packet */
+		if (IS_DEBUG_CTRL_PACKET) {
+			blog_info
+			    ("rx_jiff: %lu, rx_last_jiff: %lu, rx_intv: %u, pkt_in: %llu",
+			     rx_jiff, bfd->rx_last_jiff, rx_intv, bfd->pkt_in);
+		}
+		bfd->rx_last_jiff = rx_jiff;
+	}
+
+	/* save the latest received ctrl packet */
+	memcpy(&bfd->rpkt, cpkt, sizeof(struct bfd_ctrl_packet));
 
 	/* mark our address */
 	memcpy(bfd->src, dst, bfd->proto->namelen(dst));
@@ -193,6 +338,7 @@ bfd_recv_ctrl_packet(struct bfd_proto *proto, struct sockaddr *src,
 		if (IS_DEBUG_CTRL_PACKET) {
 			blog_info("Auth type isn't same. Discarded");
 		}
+		bfd_session_release(bfd, SESSION_FIND);
 		return -1;
 	}
 
@@ -211,7 +357,37 @@ bfd_recv_ctrl_packet(struct bfd_proto *proto, struct sockaddr *src,
 
 	/* If the Required Min Echo RX Interval field is zero, the
 	   transmission of Echo packets, if any, MUST cease. */
-	/* FIXME */
+#ifdef __KERNEL__
+	if (GET_ECHO_PRIV_FIELD(bfd, peer_echo_rx_intv) !=
+	    ntohl(cpkt->req_min_echo_rx_intv)) {
+
+                if (!SET_ECHO_PRIV_FIELD(bfd, peer_echo_rx_intv,
+                                         ntohl(cpkt->req_min_echo_rx_intv))) {
+                   
+                   SET_ECHO_PRIV_FIELD(bfd, act_echo_tx_intv, 0);
+                   SET_ECHO_PRIV_FIELD(bfd, echo_detect_time, 0);
+                   bfd_stop_echo(bfd);
+                } else {
+                   
+                   long tx, rx;
+                   
+                   tx = ntohl(bfd->cpkt.des_min_tx_intv);
+                   rx = GET_ECHO_PRIV_FIELD(bfd, peer_echo_rx_intv);
+
+                   tx = SET_ECHO_PRIV_FIELD(bfd, act_echo_tx_intv, tx<rx?rx:tx);
+                   SET_ECHO_PRIV_FIELD(bfd, echo_detect_time, 
+                                       bfd->cpkt.detect_mult*tx);
+        
+                   if (bfd_start_echo(bfd)) {
+                      
+                      bfd_reset_echo_tx_timer(bfd);
+                      bfd_reset_echo_expire_timer(bfd);
+                   }
+                }
+        }
+
+
+#endif
 
 	/* If Demand mode is active, a Poll Sequence is being transmitted by
 	   the local system, and the Final (F) bit in the received packet is
@@ -232,20 +408,59 @@ bfd_recv_ctrl_packet(struct bfd_proto *proto, struct sockaddr *src,
 
 		bfd->act_tx_intv =
 		    ntohl(bfd->cpkt.des_min_tx_intv) <
-		    ntohl(cpkt->req_min_rx_intv) ? ntohl(cpkt->
-							 req_min_rx_intv) :
+		    ntohl(cpkt->
+			  req_min_rx_intv) ? ntohl(cpkt->req_min_rx_intv) :
 		    ntohl(bfd->cpkt.des_min_tx_intv);
 		bfd->act_rx_intv = ntohl(bfd->cpkt.req_min_rx_intv);
+		if (IS_DEBUG_CTRL_PACKET)
+			blog_info("BFD resetting tx/rx stats.");
+		bfd_reset_tx_stats(bfd);
+		bfd_reset_rx_stats(bfd);
+	}
+        
+	/* Update the active transmit interval if the peer's min_rx has
+	 * changed and either a poll sequence has not been initiated on the 
+	 * local side or the active transmit interval will decrease as a
+	 * result of the peer's min_rx change (per Sec 6.8.3 ).
+	 */
+
+	if (!bfd->cpkt.demand && cpkt->poll &&
+	    (bfd->peer_rx_intv != ntohl(cpkt->req_min_rx_intv))) {
+
+		int act_tx_intv =
+		    ntohl(bfd->cpkt.des_min_tx_intv) <
+		    ntohl(cpkt->
+			  req_min_rx_intv) ? ntohl(cpkt->req_min_rx_intv) :
+		    ntohl(bfd->cpkt.des_min_tx_intv);
+
+		if (!bfd->cpkt.poll || (act_tx_intv < bfd->act_tx_intv)) {
+
+			bfd->act_tx_intv = act_tx_intv;
+
+			if (IS_DEBUG_CTRL_PACKET)
+				blog_info("BFD resetting tx stats.");
+			bfd_reset_tx_stats(bfd);
+		}
 	}
 
 	/* Update the Detection Time as described in section 6.7.4. */
+	old_detect_time = bfd->detect_time;
 	bfd->detect_time = cpkt->detect_mult *
 	    (bfd->act_rx_intv > ntohl(cpkt->des_min_tx_intv) ?
 	     bfd->act_rx_intv : ntohl(cpkt->des_min_tx_intv));
+	if (bfd->detect_time != old_detect_time) {
+		if (IS_DEBUG_CTRL_PACKET)
+			blog_info("BFD resetting rx stats.");
+		bfd_reset_rx_stats(bfd);
+	}
+
+	bfd->peer_tx_intv = ntohl(cpkt->des_min_tx_intv);
+	bfd->peer_rx_intv = ntohl(cpkt->req_min_rx_intv);
+	bfd->peer_mult = cpkt->detect_mult;
 
 	/* Update the transmit interval as described in section 6.7.2. */
 	if (poll_seq_end) {
-		bfd_reset_tx_timer(bfd);
+		bfd_reset_tx_timer_defer(bfd);
 	}
 	bfd->last_rcv_req_rx = cpkt->req_min_rx_intv;
 
@@ -253,6 +468,8 @@ bfd_recv_ctrl_packet(struct bfd_proto *proto, struct sockaddr *src,
 	if (bfd->cpkt.state == BSM_AdminDown) {
 		if (IS_DEBUG_CTRL_PACKET)
 			blog_info("BFD State is AdminDown. Discarded");
+		bfd_session_release(bfd, SESSION_FIND);
+                reset_rx_tx_defer(bfd);
 		return -1;
 	}
 
@@ -266,6 +483,8 @@ bfd_recv_ctrl_packet(struct bfd_proto *proto, struct sockaddr *src,
 		}
 	}
 
+
+        check_packet_work_defer(bfd);
 	if (cpkt->state == BSM_Down) {
 		bfd_bsm_event(bfd, BSM_Recived_Down);
 	} else if (cpkt->state == BSM_Init) {
@@ -298,7 +517,7 @@ bfd_recv_ctrl_packet(struct bfd_proto *proto, struct sockaddr *src,
 
 		bfd->cpkt.poll = 0;
 		bfd->cpkt.final = 1;
-		bfd_start_xmit_timer(bfd);
+                bfd_reset_tx_timer_defer(bfd);
 		bfd_send_ctrl_packet(bfd);
 		bfd->cpkt.poll = old_poll_bit;
 	}
@@ -309,8 +528,11 @@ bfd_recv_ctrl_packet(struct bfd_proto *proto, struct sockaddr *src,
 		blog_info("BFD: Detect Time is %d(usec)", bfd->detect_time);
 
 	if (bfd->cpkt.state == BSM_Up || bfd->cpkt.state == BSM_Init) {
-		bfd_reset_expire_timer(bfd);
+           bfd_reset_expire_timer(bfd);
 	}
+
+        reset_rx_tx_defer(bfd);
+	bfd_session_release(bfd, SESSION_FIND);
 
 	return 0;
 }

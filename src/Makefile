@@ -1,54 +1,70 @@
-TARGET=kbfd.o
-EXTRA_CFLAGS+=-g -Wall
-KVER=$(shell uname -r)
-KMISC := /lib/modules/$(KVER)/misc/kbfd/
-list-m=kbfd
-VERSION=0.1
+EXTRA_CFLAGS += -Wall -Werror $(INCLUDE_DIRS)
 
-DIST_FILES := kbfd_session.[ch] kbfd_packet.[ch] kbfd_main.c kbfd_log.[ch]\
-	 kbfd_v4v6.[ch] kbfd_netlink.[ch] kbfd_interface.[ch] kbfd.h \
-	Makefile README KNOWN_BUGS
-
-
-ifneq ($(KERNELRELEASE),)
-obj-m	:=$(TARGET)
-kbfd-objs := kbfd_session.o kbfd_packet.o kbfd_main.o kbfd_log.o kbfd_v4v6.o kbfd_netlink.o kbfd_interface.o
-
-else
-KDIR	:= /lib/modules/$(KVER)/build
-PWD	:= $(shell pwd)
-
-default:
-	$(MAKE)	-C $(KDIR)	SUBDIRS=$(PWD) modules
+ifdef KBFD_REFCNT_DEBUG
+	EXTRA_CFLAGS += -D KBFD_REFCNT_DEBUG
+endif
+ifdef DEBUG
+	EXTRA_CFLAGS += -D CTRL_DEBUG -D ECHO_DEBUG
+endif
+ifdef CTRL_DEBUG
+	EXTRA_CFLAGS += -D CTRL_DEBUG
+endif
+ifdef ECHO_DEBUG
+	EXTRA_CFLAGS += -D ECHO_DEBUG
 endif
 
+TARGET=kbfd
+
+obj-m += $(TARGET).o
+
+$(TARGET)-objs := \
+	kbfd_session.o \
+	kbfd_packet.o \
+	kbfd_main.o \
+	kbfd_interface.o \
+	kbfd_log.o \
+	kbfd_netlink.o \
+	kbfd_v4v6.o \
+	kbfd_feature.o \
+
+$(TARGET).objs :=  \
+	kbfd_session_proc.o \
+	kbfd_packet_proc.o \
+	kbfd_main_proc.o \
+	kbfd_log_proc.o \
+	kbfd_v4v6_proc.o \
+	kbfd_netlink_proc.o \
+	kbfd_interface_proc.o \
+	kbfd_feature_proc.o \
+	proc_compat_proc.o
+
+all: sources = Makefile kbfd_session.[ch] kbfd_packet.[ch] kbfd_main.c \
+	kbfd_log.[ch] kbfd_v4v6.[ch] kbfd_netlink.[ch] kbfd_interface.[ch] \
+	kbfd_feature.[ch] kbfd.h proc_compat.h
+all: make_modules = make -C /lib/modules/EosKernel/build modules M=$(shell pwd)
+all: make_process = make $(TARGET).proc
+all:
+	$(call make_modules)
+	$(call make_process)
+
+$(TARGET).proc: $($(TARGET).objs)
+	$(CC) -o $@ $^ -lpthread -lrt
+
+%_proc.o: %.c proc_compat.h
+	$(CC) -D_GNU_SOURCE $(EXTRA_CFLAGS) -g -c $< -o $@ 
+
+
 clean:
-	rm -f *~ ${TARGET}.o ${TARGET}.ko .${TARGET}*
-	rm -f .built_in.o.cmd built_in.o
-	rm -f .*.cmd *.ko *.mod.c *.mod.o *.o *.ko
+	-rm -f ${TARGET}.o ${TARGET}.ko 
+	-rm -f ${TARGET}.proc
+	-rm -f *.o
 
-nl_test: nl_test.c
-	gcc -g -o $@ $@.c
-
+install: make_modules_install = make -C /lib/modules/EosKernel/build modules_install M=$(shell pwd) INSTALL_MOD_PATH=$(DESTDIR) INSTALL_MOD_DIR=kernel/drivers/net
 install:
-	install -d $(KMISC)
-	install -m 644 -c $(addsuffix .ko,$(list-m)) $(KMISC)
-	/sbin/depmod -a ${KVER}
+	$(call make_modules_install)
+	install -D -m444 kbfd_netlink.h $(DESTDIR)/usr/include/kbfd/kbfd_netlink.h	
+	install -D -m755 kbfd.proc $(DESTDIR)/usr/bin/kbfd.proc
 
-zebra:
-	wget ftp://ftp.zebra.org/pub/zebra/zebra-0.95a.tar.gz
-	tar xfz zebra-0.95a.tar.gz
-	cd zebra-0.95a ;\
-	patch -p1 < ../patches/kbfd-zebra-0.95a.patch; \
-	./update-autotools; \
-	./configure --enable-ipv6; \
-	make
-
+check:
 dist:
-	mkdir -p kbfd/patches
-	cp -fr $(DIST_FILES) kbfd/
-	cp patches/kbfd-zebra-0.95a.patch kbfd/patches/kbfd-$(VERSION)-zebra-0.95a.patch 
-	tar cfz kbfd-$(VERSION).tar.gz kbfd/
-	rm -rf kbfd/
-	cp patches/kbfd-zebra-0.95a.patch kbfd-$(VERSION)-zebra-0.95a.patch 
-	gzip kbfd-$(VERSION)-zebra-0.95a.patch
+

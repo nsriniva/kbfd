@@ -21,11 +21,13 @@
  * Copyright (C) Hajime TAZAKI, 2007
  */
 
-#ifndef _BFD_PACKET_H
-#define _BFD_PACKET_H
+#ifndef __KBFD_PACKET_H__
+#define __KBFD_PACKET_H__
 
+#ifdef __KERNEL__
 #include <linux/workqueue.h>
 #include <net/sock.h>
+#endif
 
 #include "kbfd.h"
 
@@ -150,12 +152,19 @@ struct bfd_auth_packet {
 	u_int16_t auth_data;
 };
 
+struct bfd_echo_packet {
+	u_int32_t my_disc;
+	u_int32_t your_disc;
+};
+
 struct bfd_session;
 
 int bfd_sock_init(void);
 int bfd_sock_exit(void);
 int bfd_send_ctrl_packet(struct bfd_session *);
-int bfd_recv_ctrl_packet(struct bfd_proto *, struct sockaddr *,
+int bfd_recv_ctrl_packet(struct bfd_proto *, int, struct sockaddr *,
+			 struct sockaddr *, int, char *, int);
+int bfd_recv_echo_packet(struct bfd_proto *, struct sockaddr *,
 			 struct sockaddr *, int, char *, int);
 
-#endif /* _BFD_PACKET_H */
+#endif				/* __KBFD_PACKET_H__ */
