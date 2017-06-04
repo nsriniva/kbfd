@@ -39,14 +39,11 @@ Summary: kbfd development
 Provides the files necessary for BFD application development.
 
 %prep
+
 %setup -T -c
-cp %{SOURCE0} %{SOURCE1} %{SOURCE2} %{SOURCE3} %{SOURCE4} .
-cp %{SOURCE5} %{SOURCE6} %{SOURCE7} %{SOURCE8} %{SOURCE9} .
-cp %{SOURCE10} %{SOURCE11} %{SOURCE12} %{SOURCE13} %{SOURCE14} .
-cp %{SOURCE15} %{SOURCE16} %{SOURCE17} %{SOURCE18} %{SOURCE19} .
+
 
 %build
-%{?configure:exit 0}
 %{__make} %{?_smp_mflags} all
 
 %install
@@ -72,10 +69,10 @@ rm -rf $RPM_BUILD_ROOT
 
 %post
 rmmod kbfd 2>/dev/null || :
-depmod $(readlink /lib/modules/EosKernel)
+depmod $(readlink /lib/modules/$KERNEL_VER)
 true
 
 %preun
 rmmod kbfd 2>/dev/null || :
-depmod $(readlink /lib/modules/EosKernel)
+depmod $(readlink /lib/modules/$KERNEL_VER)
 true

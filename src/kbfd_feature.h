@@ -1,5 +1,3 @@
-// Copyright (c) 2014 Arista Networks, Inc.  All rights reserved.
-// Arista Networks, Inc. Confidential and Proprietary.
 
 #ifndef __KBFD_FEATURE_H__
 #define __KBFD_FEATURE_H__
@@ -8,6 +6,10 @@
 
 #include "kbfd_packet.h"
 #include "kbfd_v4v6.h"
+
+#ifndef INIT_COMPLETION
+#define INIT_COMPLETION(x) reinit_completion(&x)
+#endif
 
 struct bfd_feature_vector {
 	bool(*enabled) (struct bfd_session *);

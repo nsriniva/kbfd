@@ -1,3 +1,5 @@
+KERNEL_VER = `uname -r`
+
 EXTRA_CFLAGS += -Wall -Werror $(INCLUDE_DIRS)
 
 ifdef KBFD_REFCNT_DEBUG
@@ -41,7 +43,7 @@ $(TARGET).objs :=  \
 all: sources = Makefile kbfd_session.[ch] kbfd_packet.[ch] kbfd_main.c \
 	kbfd_log.[ch] kbfd_v4v6.[ch] kbfd_netlink.[ch] kbfd_interface.[ch] \
 	kbfd_feature.[ch] kbfd.h proc_compat.h
-all: make_modules = make -C /lib/modules/EosKernel/build modules M=$(shell pwd)
+all: make_modules = make -C /lib/modules/$(KERNEL_VER)/build modules M=$(shell pwd)
 all: make_process = make $(TARGET).proc
 all:
 	$(call make_modules)
@@ -59,7 +61,7 @@ clean:
 	-rm -f ${TARGET}.proc
 	-rm -f *.o
 
-install: make_modules_install = make -C /lib/modules/EosKernel/build modules_install M=$(shell pwd) INSTALL_MOD_PATH=$(DESTDIR) INSTALL_MOD_DIR=kernel/drivers/net
+install: make_modules_install = make -C /lib/modules/$(KERNEL_VER)/build modules_install M=$(shell pwd) INSTALL_MOD_PATH=$(DESTDIR) INSTALL_MOD_DIR=kernel/drivers/net
 install:
 	$(call make_modules_install)
 	install -D -m444 kbfd_netlink.h $(DESTDIR)/usr/include/kbfd/kbfd_netlink.h	

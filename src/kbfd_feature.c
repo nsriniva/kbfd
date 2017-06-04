@@ -1,5 +1,3 @@
-// Copyright (c) 2014 Arista Networks, Inc.  All rights reserved.
-// Arista Networks, Inc. Confidential and Proprietary.
 
 #ifdef __KERNEL__
 #include <net/sock.h>
